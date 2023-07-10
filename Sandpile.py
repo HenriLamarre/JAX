@@ -27,21 +27,20 @@ class Sandpile:
         self.B = jnp.zeros((self.n, self.n)) #The lattice
         self.Zc = 1 # The curvature criterion
         self.eps=eps # The driving parameter
-        self.seed_rng = 1 # The randomness seed
+        self.rng = np.random.default_rng(seed=1) # The randomness seed
         self.e0 = 4/5*self.Zc**2 # The energy quantum
-        self.constants = jnp.array([self.n, self.Zc, self.eps, self.seed_rng, self.e0])
 
 
     def loop_(self, maxiter, verbose=False):
         """Function in the class to run the model over maxiter iterations.
         The function loop and every other function called in it are outside the class
         as Jax cant precompile methods with self in the argument."""
-        rel_e, lat_e = loop(self.B, self.constants, maxiter, verbose)
+        rel_e, lat_e = loop(self.B, self.e0, self.Zc, self.eps,
+                             self.rng, self.n, maxiter, verbose)
         return rel_e, lat_e # Returns released energy and lattice energy
     
-def loop(B, constants, maxiter, verbose):
+def loop(B, e0, Zc, eps, rng, n, maxiter, verbose):
     maxiter = int(maxiter) # The max number of iterations
-    e0, eps = constants[4], constants[2]
     B = jnp.array(B) # We call this in case we set B after __init__ is called
     rel_e = jnp.zeros(maxiter+1, dtype=float)# Jax requires that every array has fixed shape 
     lat_e = jnp.zeros(maxiter+1, dtype=float)
@@ -51,11 +50,9 @@ def loop(B, constants, maxiter, verbose):
     iter = jnp.array([1]) # The iteration variable. 
     #It needs to be a Jax object as some functions use it as an argument
     start_loop = time.time()
-    # while iter[0] < maxiter+1: # The loop
-    #     B, iter, lat_e, rel_e = in_loop(B, lat_e, rel_e, iter,
-    #                                      rng,n,Zc, e0,eps, maxiter)
-    a = [B, lat_e, rel_e, iter,constants, maxiter]
-    lax.while_loop(cond_fun, body_fun, a)
+    while iter[0] < maxiter+1: # The loop
+        B, iter, lat_e, rel_e = in_loop(B, lat_e, rel_e, iter,
+                                         rng,n,Zc, e0,eps, maxiter)
     if verbose:
         print('The loop took {} seconds'.format(round(time.time()-start_loop,2)))
     # The following part sets the energy for the driving as I did not know how to
@@ -72,31 +69,23 @@ def loop(B, constants, maxiter, verbose):
     rel_e = rel_e.at[rel_e<0].set(e0) # Some combinations of rns yield negative energy release
     # We fix it at e0 as it is rare.
     return rel_e[1:], lat_e[1:]
-
-def cond_fun(a):
-    return a[3][0] < a[8]+1
-    
-def body_fun(a):
-    a = in_loop(a[0], a[1], a[2], a[3], a[4], a[5])
-    return a
     
 
-@partial(jit, static_argnums=(4,5,6,7,8,))
-def in_loop(B,lat_e, rel_e, iter,constants, maxiter):
+@partial(jit, static_argnums=(4,5,6,7,8,9,))
+def in_loop(B,lat_e, rel_e, iter, rng,n,Zc,e0,eps, maxiter):
     """ The loop 
     Jax cant compile functions with if statements that depend
     on the arguments so for every loop, we do both the redistribution 
     and the driving. When the model is unstable, the redistribution takes
     place and we drive for 0 iterations. When the model is stable, we 
     redistribute 0 nodes and drive for x iterations."""
-    n, Zc, eps, seed_rng, e0 = constants
     curv, unstable, curv_sign = curv_calc(B, n, Zc) # Computes the curvature
     B = B.at[:,0].set(0) # Flushes nodal value at the edges
     B = B.at[:,-1].set(0)
     B = B.at[0].set(0)
     B = B.at[-1].set(0)
     B, lat_e, rel_e, iter = redis(B, curv_sign, unstable,
-                                        lat_e, rel_e, iter, seed_rng, 
+                                        lat_e, rel_e, iter, rng, 
                                         n, Zc, e0) # Redistribution
     # Computes how many iterations of driving need to happen
     niter_todo = jnp.log10(Zc/jnp.max(jnp.abs(curv)))/jnp.log10(1+eps)+1
@@ -109,8 +98,7 @@ def in_loop(B,lat_e, rel_e, iter,constants, maxiter):
     lat_e = lat_e.at[iter[0]+niter_todo].set(e_total(B, e0)) # compute the
     # new lattice energy
     iter = iter.at[0].set(iter[0]+niter_todo) # update the iteration variable
-    a = [B, lat_e, rel_e, iter,n,Zc, e0,eps, maxiter]
-    return a
+    return B, iter, lat_e, rel_e
     
 
 @partial(jit, static_argnums=(1,))
@@ -131,9 +119,8 @@ def curv_calc(B,n,Zc):
     return curv, unstable, curv_sign
 
 @partial(jit, static_argnums=(6,7,8,9,))
-def redis(B, curv_sign, unstable, lat_e, rel_e, iter, seed_rng, n, Zc, e0):
+def redis(B, curv_sign, unstable, lat_e, rel_e, iter, rng, n, Zc, e0):
     """ Redistributes the unstable nodes to their neighbours """
-    rng = np.random.default_rng(seed=rng_seed)
     randoms = rng.uniform(0,1,size=(n, n)) #Computes a random number between 0 and 1 
     # at every position in the lattice
     sums = jnp.roll(randoms,1,axis=0)+jnp.roll(randoms,-1,axis=0)+\
